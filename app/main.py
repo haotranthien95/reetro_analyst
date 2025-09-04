@@ -295,6 +295,40 @@ async def stats_daily(
     ]
     return out
 
+@app.get("/api/stats/total-monthly")
+async def stats_total_monthly(
+    user: dict = Depends(get_current_user),
+):
+    if pool is None:
+        raise HTTPException(status_code=500, detail="DB pool not initialized")
+
+    today = datetime.today()
+    first_day_this_month = today.replace(day=1)
+    first_day_last_month = (first_day_this_month.replace(day=1) - pd.DateOffset(months=1)).to_pydatetime()
+    last_day_last_month = first_day_this_month - pd.DateOffset(days=1)
+    last_day_last_month = last_day_last_month.to_pydatetime().replace(hour=23, minute=59, second=59)
+
+    sql = """
+        SELECT
+            SUM(CASE WHEN thoi_gian >= %(start_this_month)s AND thoi_gian < %(start_next_month)s THEN thanh_tien ELSE 0 END) AS total_this_month,
+            SUM(CASE WHEN thoi_gian >= %(start_last_month)s AND thoi_gian <= %(end_last_month)s THEN thanh_tien ELSE 0 END) AS total_last_month
+        FROM public.orders
+    """
+    params = {
+        "start_this_month": first_day_this_month,
+        "start_next_month": (first_day_this_month + pd.DateOffset(months=1)).to_pydatetime(),
+        "start_last_month": first_day_last_month,
+        "end_last_month": last_day_last_month,
+    }
+
+    with pool.cursor() as cur:
+        cur.execute(sql, params)
+        row = cur.fetchone()
+
+    return {
+        "this_month": int(row["total_this_month"] or 0),
+        "last_month": int(row["total_last_month"] or 0),
+    }
 
 @app.get("/healthz")
 async def healthz():
