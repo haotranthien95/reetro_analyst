@@ -22,6 +22,8 @@ from psycopg.rows import dict_row
 
 from .settings import DATABASE_URL, OVERRIDE_KEY_FIELDS, CORS_ALLOW_ORIGINS
 from .auth import ensure_auth_bootstrap, get_current_user, router as auth_router
+import calendar
+import logging
 
 # ----------------------------------------------------------------------------
 # App setup
@@ -191,7 +193,6 @@ async def upload_form() -> str:
     </html>
     """
 
-
 @app.post("/upload-excel")
 async def upload_excel(
     file: UploadFile = File(...),
@@ -207,14 +208,10 @@ async def upload_excel(
 
     df = df.dropna(how="all")
     if df.empty:
-        return JSONResponse({"rows_processed": 0, "inserted": 0, "skipped": 0, "replaced": 0})
+        return JSONResponse({"rows_processed": 0, "inserted": 0})
 
     rows = df.values.tolist()
-    rows_processed = inserted = skipped = replaced = 0
-
-    key_fields = OVERRIDE_KEY_FIELDS
-    where_clause = build_where_clause(key_fields)
-    do_override = (override or "").lower() == "true"
+    rows_processed = inserted = 0
 
     if pool is None:
         raise HTTPException(status_code=500, detail="DB pool not initialized")
@@ -226,28 +223,10 @@ async def upload_excel(
                 data = convert_row(raw)
 
                 if not data.get("ma_dat_hang"):
-                    skipped += 1
                     continue
 
-                key_values = {k: data.get(k) for k in key_fields}
-                if any(v is None for v in key_values.values()):
-                    cur.execute(INSERT_SQL, data)
-                    inserted += 1
-                    continue
-
-                cur.execute(f"SELECT id FROM public.orders WHERE {where_clause} LIMIT 1", key_values)
-                exists = cur.fetchone() is not None
-
-                if exists:
-                    if do_override:
-                        cur.execute(f"DELETE FROM public.orders WHERE {where_clause}", key_values)
-                        cur.execute(INSERT_SQL, data)
-                        replaced += 1
-                    else:
-                        skipped += 1
-                else:
-                    cur.execute(INSERT_SQL, data)
-                    inserted += 1
+                cur.execute(INSERT_SQL, data)
+                inserted += 1
             pool.commit()
         except Exception as e:
             pool.rollback()
@@ -256,9 +235,6 @@ async def upload_excel(
     return JSONResponse({
         "rows_processed": rows_processed,
         "inserted": inserted,
-        "skipped": skipped,
-        "replaced": replaced,
-        "override_key_fields": key_fields,
     })
 
 
@@ -303,10 +279,16 @@ async def stats_total_monthly(
         raise HTTPException(status_code=500, detail="DB pool not initialized")
 
     today = datetime.today()
-    first_day_this_month = today.replace(day=1)
-    first_day_last_month = (first_day_this_month.replace(day=1) - pd.DateOffset(months=1)).to_pydatetime()
-    last_day_last_month = first_day_this_month - pd.DateOffset(days=1)
-    last_day_last_month = last_day_last_month.to_pydatetime().replace(hour=23, minute=59, second=59)
+    first_day_this_month = datetime.combine(today.replace(day=1), datetime.min.time())
+    first_day_last_month = datetime.combine(
+        (first_day_this_month.replace(day=1) - pd.DateOffset(months=1)).date(),
+        datetime.min.time()
+    )
+    last_day_last_month = datetime.combine(
+        (first_day_this_month - pd.DateOffset(days=1)).date(),
+        datetime.min.time()
+    ).replace(hour=23, minute=59, second=59, microsecond=0)
+    last_day_this_month = (first_day_this_month + pd.DateOffset(months=1) - pd.DateOffset(days=1)).to_pydatetime().replace(hour=23, minute=59, second=59)
 
     sql = """
         SELECT
@@ -328,6 +310,58 @@ async def stats_total_monthly(
     return {
         "this_month": int(row["total_this_month"] or 0),
         "last_month": int(row["total_last_month"] or 0),
+    }
+
+@app.get("/api/stats/partial-monthly")
+async def stats_partial_monthly(
+    today: date = Query(..., description="YYYY-MM-DD"),
+    user: dict = Depends(get_current_user),
+):
+    if pool is None:
+        raise HTTPException(status_code=500, detail="DB pool not initialized")
+
+    first_day_this_month = datetime.combine(today.replace(day=1), datetime.min.time())
+    last_day_this_month = datetime.combine(today, datetime.max.time()).replace(microsecond=0)
+
+    # Calculate same day last month
+    if today.month == 1:
+        last_month_year = today.year - 1
+        last_month = 12
+    else:
+        last_month_year = today.year
+        last_month = today.month - 1
+
+    try:
+        last_month_day = datetime.combine(datetime(
+            last_month_year, last_month, today.day),datetime.max.time()).replace(microsecond=0)
+    except ValueError:
+        # If last month doesn't have this day (e.g. Feb 30), use last day of last month
+        last_day = calendar.monthrange(last_month_year, last_month)[1]
+        last_month_day = datetime.combine(datetime(last_month_year, last_month, last_day), datetime.max.time()).replace(microsecond=0)
+
+    first_day_last_month = datetime(last_month_year, last_month, 1, 0, 0, 0)
+
+    sql = """
+        SELECT
+            SUM(CASE WHEN thoi_gian >= %(start_this_month)s AND thoi_gian <= %(end_this_month)s THEN thanh_tien ELSE 0 END) AS total_this_month,
+            SUM(CASE WHEN thoi_gian >= %(start_last_month)s AND thoi_gian <= %(end_last_month)s THEN thanh_tien ELSE 0 END) AS total_last_month
+        FROM public.orders
+    """
+    params = {
+        "start_this_month": first_day_this_month,
+        "end_this_month": last_day_this_month,
+        "start_last_month": first_day_last_month,
+        "end_last_month": last_month_day,
+    }
+    print(f"Partial monthly stats params: {params}")
+
+    with pool.cursor() as cur:
+        cur.execute(sql, params)
+        row = cur.fetchone()
+
+    return {
+        "totalThisMonth": int(row["total_this_month"] or 0),
+        "totalLastMonth": int(row["total_last_month"] or 0),
     }
 
 @app.get("/healthz")
