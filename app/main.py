@@ -8,6 +8,9 @@ FastAPI app to upload Excel files and insert rows into PostgreSQL `public.orders
 """
 from __future__ import annotations
 
+import math
+import re
+import unicodedata
 import pandas as pd
 from datetime import datetime, date
 from decimal import Decimal, InvalidOperation
@@ -22,8 +25,6 @@ from psycopg.rows import dict_row
 
 from .settings import DATABASE_URL, OVERRIDE_KEY_FIELDS, CORS_ALLOW_ORIGINS
 from .auth import ensure_auth_bootstrap, get_current_user, router as auth_router
-import calendar
-import logging
 
 # ----------------------------------------------------------------------------
 # App setup
@@ -79,8 +80,95 @@ DEC_COLS = {
     "phi_tra_doi_tac_giao_hang", "tong_tien_hang", "giam_gia_phieu_dat", "thu_khac", "khach_da_tra", "tien_mat",
     "the", "chuyen_khoan", "vi", "don_gia", "giam_gia_pham_tram", "giam_gia", "gia_ban", "thanh_tien",
 }
+_TABLE = "public.orders"
 TS_COLS = {"thoi_gian", "thoi_gian_tao", "thoi_gian_giao_hang"}
+def norm(s: str) -> str:
+    if s is None:
+        return ""
+    s = s.strip()
+    # NFKD để tách dấu, rồi bỏ dấu
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower()
+    # thay / và - thành khoảng trắng cho case "phường/xã"
+    s = s.replace("/", " ").replace("-", " ")
+    # bỏ mọi ký tự không phải chữ/số/khoảng trắng
+    s = re.sub(r"[^a-z0-9\s()%]", " ", s)
+    # nén khoảng trắng
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
+# ==== ALIASES: mọi biến thể header Excel → cột DB ====
+# Lưu ý: bạn có thể thêm alias nếu nhà cung cấp template đổi câu chữ
+HEADER_ALIASES = {
+   # Đơn hàng
+    "Mã đặt hàng": "ma_dat_hang",
+    "Mã hóa đơn": "ma_hoa_don",
+    "Mã vận đơn": "ma_van_don",
+    "Địa chỉ lấy hàng": "dia_chi_lay_hang",
+    "Thời gian": "thoi_gian",
+    "Thời gian tạo": "thoi_gian_tao",
+
+    # Khách hàng
+    "Mã khách hàng": "ma_khach_hang",
+    "Tên khách hàng": "ten_khach_hang",
+    "Điện thoại": "dien_thoai",
+    "Địa chỉ (Khách hàng)": "dia_chi_khach_hang",
+    "Khu vực (Khách hàng)": "khu_vuc",
+    "Phường/Xã (Khách hàng)": "phuong_xa",
+
+    # Người đặt
+    "Người nhận đặt": "nguoi_nhan_dat",
+    "Kênh bán": "kenh_ban",
+    "Người tạo": "nguoi_tao",
+
+    # Người nhận
+    "Đối tác giao hàng": "doi_tac_giao_hang",
+    "Người nhận": "nguoi_nhan",
+    "Điện thoại (Người nhận)": "dien_thoai_nguoi_nhan",
+    "Địa chỉ (Người nhận)": "dia_chi_nguoi_nhan",
+    "Khu vực (Người nhận)": "khu_vuc_nguoi_nhan",
+    "Phường/Xã (Người nhận)": "xa_phuong_nguoi_nhan",
+
+    # Vận chuyển
+    "Dịch vụ": "dich_vu",
+    "Trọng lượng (gram)": "trong_luong",
+    "Dài": "dai",
+    "Rộng": "rong",
+    "Cao": "cao",
+    "Phí trả ĐTGH (trả ĐT)": "phi_tra_doi_tac_giao_hang",
+
+    # Thông tin đơn
+    "Ghi chú": "ghi_chu",
+    "Tổng tiền hàng": "tong_tien_hang",
+    "Giảm giá phiếu đặt": "giam_gia_phieu_dat",
+    "Thu khác": "thu_khac",
+
+    # ⚠️ Cột “Khách cần trả” KHÔNG có trong COLUMNS_ORDER → bỏ qua, không map
+    "Khách đã trả": "khach_da_tra",
+    "Tiền mặt": "tien_mat",
+    "Thẻ": "the",
+    "Chuyển khoản": "chuyen_khoan",
+    "Ví": "vi",
+    "ĐVT": "don_vi_tinh",
+    "Điểm": "diem",
+
+    "Thời gian giao hàng": "thoi_gian_giao_hang",
+    "Trạng thái": "trang_thai",
+
+    # Hàng hóa
+    "Mã hàng": "ma_hang",
+    "Mã vạch": "ma_vach",
+    "Tên hàng": "ten_hang",
+    "Thương hiệu": "thuong_hieu",
+    "Ghi chú hàng hóa": "ghi_chu_hang_hoa",
+    "Số lượng": "so_luong",
+    "Đơn giá": "don_gia",
+    "Giảm giá %": "giam_gia_pham_tram",
+    "Giảm giá": "giam_gia",
+    "Giá bán": "gia_ban",
+    "Thành tiền": "thanh_tien",
+}
 
 def _is_na(v: Any) -> bool:
     return v is None or (isinstance(v, float) and pd.isna(v)) or (isinstance(v, str) and v.strip() == "")
@@ -159,14 +247,79 @@ def build_where_clause(key_fields: List[str]) -> str:
         raise ValueError("OVERRIDE_KEY_FIELDS must not be empty")
     return " AND ".join([f"{f} = %({f})s" for f in key_fields])
 
+def nan_to_none(d: dict) -> dict:
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, float) and math.isnan(v):
+            out[k] = None
+        elif pd.isna(v):
+            out[k] = None
+        else:
+            out[k] = v
+    return out
 
-INSERT_SQL = f"""
-INSERT INTO public.orders (
-    {', '.join(COLUMNS_ORDER)}
-) VALUES (
-    {', '.join([f'%({c})s' for c in COLUMNS_ORDER])}
-)
-"""
+def build_header_map(raw_headers: list[str]) -> dict:
+    """
+    raw_headers: danh sách header đọc từ file Excel (hàng đầu tiên).
+    Trả về map: {raw_header: db_column} (chỉ gồm những cột có trong DB).
+    """
+    mapping = {}
+    unknown_headers = []
+
+    for h in raw_headers:
+        key = h
+        print("key", key)
+        db_col = HEADER_ALIASES.get(key)
+        if db_col is None:
+            # None: header hợp lệ nhưng không có trong DB (vd 'Khách cần trả') => bỏ qua
+            continue
+        if db_col:
+            mapping[h] = db_col
+        else:
+            unknown_headers.append(h)
+
+    # (Tùy chọn) bạn có thể log các header không map được để kiểm tra template mới
+    print("Unknown headers (ignored):", unknown_headers)
+    print("headers:", mapping)
+
+    return mapping
+
+def read_excel_with_header(fileobj) -> pd.DataFrame:
+    """
+    Đọc Excel với row 0 là header tiếng Việt, rename về cột DB,
+    chỉ giữ các cột có trong DB (COLUMNS_ORDER).
+    """
+    df = pd.read_excel(fileobj, header=0, engine="openpyxl")
+    # Bỏ toàn dòng trống
+    df = df.dropna(how="all")
+    if df.empty:
+        return df
+
+    header_map = build_header_map(list(df.columns))
+    # Đổi tên cột về DB
+    df = df.rename(columns=header_map)
+
+    # Chỉ giữ các cột đã định nghĩa trong DB
+    keep_cols = [c for c in COLUMNS_ORDER if c in df.columns]
+    df = df[keep_cols]
+
+    return df
+
+def _build_insert_sql() -> str:
+    cols = ", ".join(COLUMNS_ORDER)
+    params = ", ".join([f"%({c})s" for c in COLUMNS_ORDER])
+    return f"INSERT INTO {_TABLE} ({cols}) VALUES ({params})"
+
+def _build_update_sql() -> str:
+    # UPDATE tất cả cột (kể cả 2 khóa – không sao vì WHERE vẫn fix theo khóa hiện tại)
+    set_clause = ", ".join([f"{c} = %({c})s" for c in COLUMNS_ORDER])
+    where_clause = " AND ".join([f"{k} = %({k})s" for k in OVERRIDE_KEY_FIELDS])
+    return f"UPDATE {_TABLE} SET {set_clause} WHERE {where_clause}"
+
+INSERT_SQL = _build_insert_sql()
+UPDATE_SQL = _build_update_sql()
+WHERE_CLAUSE = " AND ".join([f"{k} = %({k})s" for k in OVERRIDE_KEY_FIELDS])
+
 
 # ----------------------------------------------------------------------------
 # Routes
@@ -193,6 +346,9 @@ async def upload_form() -> str:
     </html>
     """
 
+def _parse_override_flag(override: Optional[str]) -> bool:
+    return str(override).strip().lower() in {"true", "1", "yes", "y"}
+
 @app.post("/upload-excel")
 async def upload_excel(
     file: UploadFile = File(...),
@@ -201,32 +357,54 @@ async def upload_excel(
     if not file.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="Please upload a .xlsx Excel file")
 
-    try:
-        df = pd.read_excel(file.file, header=None, engine="openpyxl")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to read Excel: {e}")
-
-    df = df.dropna(how="all")
-    if df.empty:
-        return JSONResponse({"rows_processed": 0, "inserted": 0})
-
-    rows = df.values.tolist()
-    rows_processed = inserted = 0
-
     if pool is None:
         raise HTTPException(status_code=500, detail="DB pool not initialized")
 
+    # Đọc & chuẩn hóa DataFrame
+    try:
+        df = read_excel_with_header(file.file)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read Excel: {e}")
+
+    if df is None or df.empty:
+        return JSONResponse({"rows_processed": 0, "inserted": 0, "skipped": 0, "replaced": 0})
+
+    rows_processed = inserted = skipped = replaced = 0
+    do_override = _parse_override_flag(override)
+
     with pool.cursor() as cur:
         try:
-            for raw in rows:
+            for _, row in df.iterrows():
                 rows_processed += 1
-                data = convert_row(raw)
+                data = nan_to_none(row.to_dict())
 
-                if not data.get("ma_dat_hang"):
+                key_ok = bool(data.get("ma_dat_hang")) and bool(data.get("ma_hang"))
+
+                if not key_ok:
+                    # Thiếu 1 trong 2 khóa ⇒ không thể xác định trùng ⇒ insert thẳng
+                    cur.execute(INSERT_SQL, data)
+                    inserted += 1
                     continue
 
-                cur.execute(INSERT_SQL, data)
-                inserted += 1
+                # Thử INSERT nếu chưa tồn tại (dựa trên where thủ công)
+                # Cách: SELECT tồn tại trước → nhanh và rõ ràng cho thống kê
+                cur.execute(
+                    f"SELECT 1 FROM {_TABLE} WHERE {WHERE_CLAUSE} LIMIT 1",
+                    {k: data.get(k) for k in OVERRIDE_KEY_FIELDS}
+                )
+                exists = cur.fetchone() is not None
+
+                if not exists:
+                    cur.execute(INSERT_SQL, data)
+                    inserted += 1
+                else:
+                    if do_override:
+                        # UPDATE theo cặp khóa
+                        cur.execute(UPDATE_SQL, data)
+                        replaced += 1
+                    else:
+                        skipped += 1
+
             pool.commit()
         except Exception as e:
             pool.rollback()
@@ -235,8 +413,12 @@ async def upload_excel(
     return JSONResponse({
         "rows_processed": rows_processed,
         "inserted": inserted,
+        "skipped": skipped,
+        "replaced": replaced,
+        "override": do_override,
+        "override_key_fields": list(OVERRIDE_KEY_FIELDS),
+        "accepted_columns": COLUMNS_ORDER,
     })
-
 
 @app.get("/api/stats/daily")
 async def stats_daily(
@@ -279,16 +461,10 @@ async def stats_total_monthly(
         raise HTTPException(status_code=500, detail="DB pool not initialized")
 
     today = datetime.today()
-    first_day_this_month = datetime.combine(today.replace(day=1), datetime.min.time())
-    first_day_last_month = datetime.combine(
-        (first_day_this_month.replace(day=1) - pd.DateOffset(months=1)).date(),
-        datetime.min.time()
-    )
-    last_day_last_month = datetime.combine(
-        (first_day_this_month - pd.DateOffset(days=1)).date(),
-        datetime.min.time()
-    ).replace(hour=23, minute=59, second=59, microsecond=0)
-    last_day_this_month = (first_day_this_month + pd.DateOffset(months=1) - pd.DateOffset(days=1)).to_pydatetime().replace(hour=23, minute=59, second=59)
+    first_day_this_month = today.replace(day=1)
+    first_day_last_month = (first_day_this_month.replace(day=1) - pd.DateOffset(months=1)).to_pydatetime()
+    last_day_last_month = first_day_this_month - pd.DateOffset(days=1)
+    last_day_last_month = last_day_last_month.to_pydatetime().replace(hour=23, minute=59, second=59)
 
     sql = """
         SELECT
@@ -310,58 +486,6 @@ async def stats_total_monthly(
     return {
         "this_month": int(row["total_this_month"] or 0),
         "last_month": int(row["total_last_month"] or 0),
-    }
-
-@app.get("/api/stats/partial-monthly")
-async def stats_partial_monthly(
-    today: date = Query(..., description="YYYY-MM-DD"),
-    user: dict = Depends(get_current_user),
-):
-    if pool is None:
-        raise HTTPException(status_code=500, detail="DB pool not initialized")
-
-    first_day_this_month = datetime.combine(today.replace(day=1), datetime.min.time())
-    last_day_this_month = datetime.combine(today, datetime.max.time()).replace(microsecond=0)
-
-    # Calculate same day last month
-    if today.month == 1:
-        last_month_year = today.year - 1
-        last_month = 12
-    else:
-        last_month_year = today.year
-        last_month = today.month - 1
-
-    try:
-        last_month_day = datetime.combine(datetime(
-            last_month_year, last_month, today.day),datetime.max.time()).replace(microsecond=0)
-    except ValueError:
-        # If last month doesn't have this day (e.g. Feb 30), use last day of last month
-        last_day = calendar.monthrange(last_month_year, last_month)[1]
-        last_month_day = datetime.combine(datetime(last_month_year, last_month, last_day), datetime.max.time()).replace(microsecond=0)
-
-    first_day_last_month = datetime(last_month_year, last_month, 1, 0, 0, 0)
-
-    sql = """
-        SELECT
-            SUM(CASE WHEN thoi_gian >= %(start_this_month)s AND thoi_gian <= %(end_this_month)s THEN thanh_tien ELSE 0 END) AS total_this_month,
-            SUM(CASE WHEN thoi_gian >= %(start_last_month)s AND thoi_gian <= %(end_last_month)s THEN thanh_tien ELSE 0 END) AS total_last_month
-        FROM public.orders
-    """
-    params = {
-        "start_this_month": first_day_this_month,
-        "end_this_month": last_day_this_month,
-        "start_last_month": first_day_last_month,
-        "end_last_month": last_month_day,
-    }
-    print(f"Partial monthly stats params: {params}")
-
-    with pool.cursor() as cur:
-        cur.execute(sql, params)
-        row = cur.fetchone()
-
-    return {
-        "totalThisMonth": int(row["total_this_month"] or 0),
-        "totalLastMonth": int(row["total_last_month"] or 0),
     }
 
 @app.get("/healthz")
